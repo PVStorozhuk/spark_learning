@@ -1,0 +1,104 @@
+# Local Spark 4.1 + Iceberg lab: standalone cluster (1 master, 2 workers), History Server,
+# Jupyter as the driver, and a Postgres-backed Iceberg JDBC catalog.
+# Start from the repository root:  docker compose up -d
+name: sparklab
+
+x-spark: &spark
+  image: sparklab:4.1.3
+  pull_policy: never  # built locally by spark-master, never pulled
+  environment: &spark-env
+    SPARK_PUBLIC_DNS: localhost
+  restart: unless-stopped
+
+services:
+  spark-master:
+    <<: *spark
+    build: ./env
+    pull_policy: build
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      <<: *spark-env
+      SPARK_MASTER_HOST: spark-master
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  spark-worker-1:
+    <<: *spark
+    hostname: spark-worker-1
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment: &worker-env
+      <<: *spark-env
+      SPARK_WORKER_CORES: "4"
+      SPARK_WORKER_MEMORY: 8g
+      SPARK_WORKER_WEBUI_PORT: "8081"
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes: &data-volumes
+      - warehouse:/opt/warehouse
+      - lab-data:/opt/data
+    depends_on: [spark-master]
+
+  spark-worker-2:
+    <<: *spark
+    hostname: spark-worker-2
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      <<: *worker-env
+      SPARK_WORKER_WEBUI_PORT: "8082"
+    ports:
+      - "127.0.0.1:8082:8082"
+    volumes: *data-volumes
+    depends_on: [spark-master]
+
+  spark-history:
+    <<: *spark
+    hostname: spark-history
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.history.HistoryServer"]
+    ports:
+      - "127.0.0.1:18080:18080"
+    volumes:
+      - spark-events:/opt/spark/events
+    depends_on: [spark-master]
+
+  jupyter:
+    <<: *spark
+    hostname: jupyter
+    command: ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--IdentityProvider.token="]
+    ports:
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:4040-4045:4040-4045"
+    volumes:
+      - warehouse:/opt/warehouse
+      - lab-data:/opt/data
+      - spark-events:/opt/spark/events
+      - ./labs:/workspace/labs
+      - ./capstone:/workspace/capstone
+      - ./env:/workspace/env:ro
+    depends_on:
+      spark-master:
+        condition: service_started
+      iceberg-catalog-db:
+        condition: service_healthy
+
+  iceberg-catalog-db:
+    image: postgres:18
+    hostname: iceberg-catalog-db
+    environment:
+      POSTGRES_DB: iceberg
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: iceberg
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg -d iceberg"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  warehouse:
+  lab-data:
+  spark-events:
+  pgdata:

@@ -22,3 +22,10 @@ checkpoints/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Personal course artifacts: session logs, diagrams, Obsidian settings
+notes/
+.obsidian/
+
+# Claude Code personal settings
+.claude/settings.local.json

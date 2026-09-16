@@ -1,0 +1,94 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch",
+      "Skill(teach)",
+      "Skill(visualize)",
+      "Bash(date)",
+      "Bash(date *)",
+      "Bash(docker compose up -d)",
+      "Bash(docker compose up -d *)",
+      "Bash(docker compose ps)",
+      "Bash(docker compose ps *)",
+      "Bash(docker compose logs *)",
+      "Bash(docker compose stop)",
+      "Bash(docker compose down)",
+      "Bash(docker compose exec jupyter spark-submit *)",
+      "Bash(docker compose exec -T jupyter spark-submit *)",
+      "Bash(python .claude/skills/visualize/render.py *)",
+      "Edit(/notes/**)",
+      "Edit(/labs/**)",
+      "Edit(/capstone/**)",
+      "Edit(/curriculum/PROGRESS.md)"
+    ],
+    "ask": [
+      "Bash(docker compose down -v*)",
+      "Bash(docker compose down --volumes*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-Command", "Write-Output 'Context was just compacted. If a lesson is in progress, invoke the teach skill again (/teach) before continuing.'"]
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/session-log.ps1"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/session-log.ps1"],
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/session-log.ps1"],
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/session-log.ps1"],
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
