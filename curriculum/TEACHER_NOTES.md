@@ -76,6 +76,14 @@ Sources: https://trino.io/docs/current/overview/concepts.html · https://trino.i
 - A good first surprise: `df.groupBy("k").count()` in a cell produces no job.
 - A good second surprise: reading a CSV without a schema produces a job before any action.
 
+**Lab 01 observed outcomes** (Spark 4.1.3, lab cluster 4 executors × 2 cores; verified 2026-09-16 … 20)
+
+- `spark.read.parquet(path)` on a bare path runs a **1-task job** (`parquet at NativeMethodAccessorImpl.java:0`) before any action: eager schema inference reads one file's footer through `SchemaMergeUtils.mergeSchemasInParallel` (`ParquetUtils.inferSchema`, `mergeSchema=false` picks one file; parallelism = `min(nFiles, defaultParallelism)`). `.schema(...)` skips it (`DataSource.getOrInferFileFormatSchema`). Directory listing stays on the driver below `spark.sql.sources.parallelPartitionDiscovery.threshold` = 32 paths. Verified against branch-4.1 source by the researcher.
+- Exp 1 (`orders` 8 files, `customers` 1 file): 5 chained transformations → 0 jobs. `top.count()` → **4 jobs**: [1 task: read customers for broadcast] → [8 tasks: scan + filter + partial count, shuffle write ≈ 745 KB] → [1 task + 8 skipped: AQE coalesced 200 → 1, final agg, BHJ, partial count] → [1 task + 9 skipped]. `top.show(5)` → 3 new jobs, orders rescanned (nothing reused across actions). `explain()` → 0 jobs.
+- Exp 3 (`orders_csv`, 4 files, 66.6 MB): header-only read → 1 job, 1 task, 1 record; `inferSchema=True` → 2 jobs: 1 task (header) + **8 tasks reading all 2,000,004 records** (CSV is splittable: 8 splits from 4 files); explicit schema → 0 jobs; `printSchema()` → 0.
+- Exp 2 (filter → groupBy → BHJ → write) with AQE on → **3 jobs** (broadcast build 1 task; map 8 tasks, shuffle write 1.4 MB, 79,989 partial rows; reduce 1 task after `AQEShuffleRead` 200 → 1, output 113 KB in 1 file). With `spark.sql.adaptive.enabled=false` → **2 jobs**: broadcast build; one job with map (8) + reduce (**200 tasks**), output 473 KB in 200 files. Variant `result.groupBy("customer_id").agg(max)` adds **no** Exchange (BHJ preserves the streamed side's hash partitioning).
+- Standalone gotcha: an idle notebook session holds all 8 cores (`spark.cores.max` unset); a second app waits with "Initial job has not accepted any resources". Have the learner shut the other kernel down.
+
 Sources: https://github.com/apache/spark/blob/v4.2.0/sql/api/src/main/scala/org/apache/spark/sql/RelationalGroupedDataset.scala · https://github.com/apache/spark/blob/v4.2.0/sql/api/src/main/scala/org/apache/spark/sql/SparkSession.scala · https://github.com/apache/spark/blob/v4.2.0/core/src/main/scala/org/apache/spark/scheduler/DAGScheduler.scala · https://spark.apache.org/docs/latest/spark-connect-gotchas.html
 
 ---
@@ -110,6 +118,12 @@ Sources: https://spark.apache.org/docs/latest/sql-programming-guide.html · http
 
 - Experiment 1 (`groupBy("customer_id").count()`): also ask the learner to predict how many aggregate nodes appear and on which side of the `Exchange`.
 - Experiment 3 (shuffle partitions): AQE coalescing hides a too-high value. Run the "clearly bad" setting with `spark.sql.adaptive.coalescePartitions.enabled=false` first, then turn it back on and compare. A too-*low* value cannot be rescued by AQE, which coalesces but does not split non-skewed partitions.
+
+**Lab 03 observed outcomes** (Spark 4.1.3, 4 executors × 2 cores on 2 worker hosts; `orders_big` = 24 M rows, 16 Parquet files, 1.1 GB; verified 2026-09-21 … 28)
+
+- Exp 1: plain `groupBy(customer_id).agg(count, sum)` → partial HashAggregate → Exchange → final; shuffle write **2.84 MiB / 160,000 records** (16 × 10,000); AQE → 2 reduce tasks. `repartition("customer_id")` first → one Exchange before the partial aggregate, **231 MiB / 24 M records**, 9 reduce tasks. Warm timings 0.6 s vs 1.0 s (the first run is always cold — re-run both).
+- Exp 2: `filter(amount > 400)` (4.85 M rows kept) → `coalesce(4)`: 1 stage, **4 tasks do the scan + filter**, 3.4 s; `repartition(4)`: 16-task map (257.6 MiB shuffle) + 4-task write, **2.3 s** (faster: upstream parallelism kept). 4 output files each. `coalesce(32)` → 16, `repartition(32)` → 32, and **`repartition(32).rdd.getNumPartitions()` executes the shuffle map stage (1.28 GB) under AQE**.
+- Exp 3 **design flaw**: `row_number() … filter(rn == 1)` triggers Spark 3.5+'s `WindowGroupLimit` pushdown (partial group limit before the Exchange) → only ~160 K rows / 1.9 MiB shuffled. The notebook's workload must be the full window without a filter, forced with `write.format("noop")` (fix the notebook before reuse). With the fixed workload (~1.24 GB shuffle): 4 partitions → 4 × 312 MiB tasks, 14.6 s, no spill at lab memory; 2000 → 20 ms tasks, 8.0 s, 31,792 blocks fetched; 2000 + AQE → **21 tasks** (64 MB target), 5.2 s; 4 + AQE unchanged; hand-set 21 → 5.4 s, 336 blocks. Shuffle read is exactly 50 % local / 50 % remote (2 hosts).
 
 Sources: https://github.com/apache/spark/blob/v4.2.0/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/FilePartition.scala · https://github.com/apache/spark/blob/v4.2.0/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/CoalesceShufflePartitions.scala · https://github.com/apache/spark/blob/v4.2.0/sql/api/src/main/scala/org/apache/spark/sql/Dataset.scala
 
@@ -184,6 +198,13 @@ Sources: https://github.com/apache/spark/blob/v4.2.0/sql/core/src/main/scala/org
 - Outer joins: salt the row-preserving side and replicate only the other side. Replicating the preserving side gives wrong results: unmatched rows appear N times, and matched keys gain spurious null-extended rows for salt values with no match. FULL OUTER cannot be salted this way. AQE follows the same rule.
 - Salted aggregation: two-phase (aggregate by `(key, salt)`, then by `key`), valid for decomposable aggregates only.
 
+**Lab 05 observed outcomes** (Spark 4.1.3, 4 executors × 2 cores; `orders_skew` = 14 M rows / 16 files / 601 MB, customer 1 = 6,000,000 rows spread over all files; dim = `customers_big` 2 M rows / 149 MiB → SortMergeJoin; verified 2026-09-30)
+
+- Baseline (skew join off, coalescing on): join stage 12 tasks; shuffle read min 5.3 / median 59.1 / **max 290.4 MiB (6.04 M rows)**; duration 1.03 s median / 2.36 s max; no spill; 4.4 s. Coalescing off: 200 tasks, median 2.8 MiB / 50 K rows, max unchanged (the hot bucket already exceeded the 64 MB target, so it was never merged): **121× in rows, 54× in duration**; 3.7 s. At lab scale the damage is small (12 tasks on 8 cores = two waves anyway); the signature is not.
+- Salting (hot key only, N = 16, `pmod(hash(order_id), 16)`, `explode` on the dim): join stage 16 tasks, max/median 1.05×, max task 1.53 s; fact write +20 MiB (salt column), dim +15 rows; **warm 2.8 s vs 4.4 s plain**. The first (cold) salted run was 5.9 s — always compare warm vs warm in the same session. `explode` makes the dim scan noticeably costlier (10.6 s vs 2.9 s executor time on the cold run).
+- Alternatives on the same data (warm): **AQE skew join 2.6 s** (fires with default thresholds: fact-side `AQEShuffleRead` 19 partitions = 11 coalesced + 1 skewed partition in 8 splits, one per map block of ~36 MiB; dim side 19 with the hot partition read 8×; max task 1.39 s); **broadcast 3.3 s** (`BroadcastExchange` data size 527.3 MiB for 149 MiB of Parquet; collect 0.42 + build 0.95 + ship 0.46 s; join tasks 1.1 / 1.3 / 1.3 s). Order: plain 4.4 > broadcast 3.3 > salting 2.8 > AQE 2.6. The first query of each session is cold (5.9 s for AQE's first run) — always re-run warm.
+- Lab 04 aside relevant here: `createDataFrame` from a Python list → `Scan ExistingRDD`, unknown size, never auto-broadcast → `CartesianProduct` for a non-equi inner join; `F.broadcast` → `BroadcastNestedLoopJoin` (8 tasks, 2 M reads vs 64 tasks, 16 M reads).
+
 Sources: https://github.com/apache/spark/blob/v4.2.0/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/OptimizeSkewedJoin.scala · https://github.com/apache/spark/blob/v4.2.0/sql/core/src/main/scala/org/apache/spark/sql/execution/aggregate/AggUtils.scala · https://github.com/apache/spark/blob/v4.2.0/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/ShufflePartitionsUtil.scala · https://spark.apache.org/docs/latest/configuration.html#scheduling · https://github.com/trinodb/trino/issues/1261
 
 ---
@@ -226,6 +247,12 @@ Sources: https://github.com/apache/spark/blob/v4.2.0/sql/core/src/main/scala/org
    - Memory per task shrinks as executor cores grow.
    - Check memory-heavy operators (`collect_list`, wide aggregations, sort), cache competing for memory, and join strategy.
    - Add memory only after these.
+
+**Lab 06 hidden causes** (generated 2026-10-01; never state before the learner has committed to a diagnosis)
+
+- `scenario_1.ipynb` — **not skew**: `/opt/data/m6/events/part_b` is ONE gzip-compressed CSV (12 M rows) next to 16 plain 1 M-row CSV files in `part_a`. Gzip CSV is not splittable → the scan stage has ~17 tasks, one of which reads 12 M rows (large *Input* size/records, no shuffle read at all) and runs many times longer. Evidence to expect from the learner: the slow task is in the *scan* stage, its Input Size / Records is ~12× the median, Shuffle Read is empty → rules out a hot key. Fix: get the source delivered as splittable files (uncompressed / bzip2 / several gz files / Parquet); `repartition` after the read only helps downstream stages, not the read itself. Speculation would not help (same file).
+- Scenario 2 (`nightly_report.py`, two finished apps in the History Server) — **join strategy flip after the dimension crossed the broadcast threshold**: `customers/dt=2026-09-30` is 100 K rows (~7 MB → `BroadcastHashJoin`), `dt=2026-10-01` is 1 M rows (~74 MB → `SortMergeJoin`, with a 1.24 GB shuffle of `orders_big` and a sort; too big for AQE's runtime conversion). Evidence: SQL tab plans differ (BHJ vs SMJ, extra Exchange + Sort), a new stage with ~1.2 GB shuffle write, dimension input records 10× larger; fact input identical. Fixes: broadcast hint / raise the threshold if the driver can take it, or accept SMJ. A good answer first scopes "what changed" (data, code, config, cluster) and compares against the good run.
+- `scenario_3.ipynb` — `spark.sql.shuffle.partitions` 200 → 2 with AQE on: before = AQE coalesces to ~21 tasks of ~60 MiB; after = 2 tasks of ~620 MiB each (only 2 of 8 cores busy, per-task working set past the ~800 MB execution share → expect spill and long tasks). AQE cannot split. Scaled-down version of the roadmap's 200 → 20.
 
 Sources: https://spark.apache.org/docs/latest/web-ui.html · https://spark.apache.org/docs/latest/monitoring.html · https://spark.apache.org/docs/latest/tuning.html
 
@@ -286,6 +313,7 @@ Sources: https://spark.apache.org/docs/latest/tuning.html#memory-management-over
   - `WHEN NOT MATCHED BY SOURCE` disables target pruning, so copy-on-write rewrites every file
 - `DELETE` is metadata-only when the filter covers whole partitions or file metrics prove every row matches.
 - `CALL cat.system.rewrite_data_files(...)`: `strategy` is `binpack` (default) or `sort`; z-order is `strategy => 'sort', sort_order => 'zorder(c1,c2)'`.
+- **Statistics Iceberg reports to Spark's optimizer** (researcher, 2026-10-01; Iceberg `main`, `spark/v4.1` `SparkScan.estimateStatistics`, not diffed against the 1.11 tag): `numRows` = snapshot summary `total-records` only for a *partitioned table with no pushed filters*; otherwise the sum of record counts over planned task groups *after partition / file pruning*. `sizeInBytes` = rows × estimated width of the pruned read schema (not file bytes). So a partition filter shrinks the broadcast estimate (unlike a Parquet path scan); non-partition filters only as far as whole files are pruned. Column stats: NDV only, from a Puffin file for the current snapshot (`CALL system.compute_table_stats`), reported only if `spark.sql.iceberg.report-column-stats` (default true) **and** `spark.sql.cbo.enabled` (default false). `ANALYZE TABLE` on Iceberg: unconfirmed (Spark maps it to v1 commands only) — say "use the procedure".
 - Diagnose files with metadata tables:
   - `cat.db.tbl.files`: `partition`, `record_count`, `file_size_in_bytes`
   - `.partitions`: `file_count`
